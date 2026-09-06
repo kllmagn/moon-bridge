@@ -174,3 +174,54 @@ func TestPrependThinkingWarnsWhenUsingRequiredFallback(t *testing.T) {
 		t.Fatalf("unexpected warning for cached thinking = %q", logs.String())
 	}
 }
+
+// A placeholder thinking block (no text, no signature) is injected to satisfy the
+// provider's presence check; it is not replayable reasoning and must not count as
+// one. Otherwise it masks a later cache hit and the real thinking never replays,
+// which surfaces as 400 "content[].thinking ... must be passed back to the API".
+func TestHasThinkingBlockIgnoresPlaceholder(t *testing.T) {
+	if HasThinkingBlock([]format.CoreContentBlock{RequiredThinkingBlock()}) {
+		t.Error("placeholder thinking block should not count as replayable")
+	}
+	if !HasThinkingBlock([]format.CoreContentBlock{{Type: "reasoning", ReasoningSignature: "sig"}}) {
+		t.Error("signature-only reasoning block is replayable")
+	}
+	if !HasThinkingBlock([]format.CoreContentBlock{{Type: "reasoning", ReasoningText: "thought"}}) {
+		t.Error("reasoning block with text is replayable")
+	}
+}
+
+// Prepending a cached block onto a turn that carries a placeholder must replace
+// it, not stack a second thinking block in front of it.
+func TestPrependThinkingForToolUseReplacesPlaceholder(t *testing.T) {
+	p := NewPlugin(func(string) bool { return true })
+	state := NewState()
+	state.RememberForToolCalls([]string{"call-1"}, format.CoreContentBlock{
+		Type:               "reasoning",
+		ReasoningText:      "real thinking",
+		ReasoningSignature: "sig-1",
+	})
+
+	messages := []format.CoreMessage{{
+		Role: "assistant",
+		Content: []format.CoreContentBlock{
+			RequiredThinkingBlock(), // leftover placeholder from an earlier request
+			{Type: "tool_use", ToolUseID: "call-1", ToolName: "exec_command"},
+		},
+	}}
+
+	got := p.PrependThinkingForToolUse(messages, "call-1", nil, state)
+	thinking := 0
+	for _, block := range got[0].Content {
+		if block.Type != "reasoning" {
+			continue
+		}
+		thinking++
+		if block.ReasoningText != "real thinking" || block.ReasoningSignature != "sig-1" {
+			t.Fatalf("placeholder not replaced with cached thinking: %+v", got[0].Content)
+		}
+	}
+	if thinking != 1 {
+		t.Fatalf("got %d reasoning blocks, want exactly 1: %+v", thinking, got[0].Content)
+	}
+}

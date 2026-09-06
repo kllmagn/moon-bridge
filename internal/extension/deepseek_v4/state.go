@@ -140,10 +140,17 @@ func PrependThinkingBlockForToolUse(messages *[]anthropic.Message, block format.
 	if lastIndex < 0 || (*messages)[lastIndex].Role != "assistant" {
 		return false
 	}
-	if HasThinkingBlock(anthropicBlocksToCore((*messages)[lastIndex].Content)) {
+	existing := anthropicBlocksToCore((*messages)[lastIndex].Content)
+	if HasThinkingBlock(existing) {
 		return false
 	}
-	(*messages)[lastIndex].Content = append([]anthropic.ContentBlock{coreBlockToAnthropic(block)}, (*messages)[lastIndex].Content...)
+	// Drop any placeholder left by an earlier request so the real block takes its
+	// place instead of producing two thinking blocks in one turn.
+	kept := StripPlaceholderThinkingBlocks(existing)
+	rebuilt := make([]anthropic.ContentBlock, 0, len(kept)+1)
+	rebuilt = append(rebuilt, coreBlockToAnthropic(block))
+	rebuilt = append(rebuilt, coreBlocksToAnthropic(kept)...)
+	(*messages)[lastIndex].Content = rebuilt
 	return true
 }
 
@@ -155,7 +162,7 @@ func (state *State) PrependCachedForAssistantText(blocks []format.CoreContentBlo
 	if !ok {
 		return blocks
 	}
-	return append([]format.CoreContentBlock{block}, blocks...)
+	return append([]format.CoreContentBlock{block}, StripPlaceholderThinkingBlocks(blocks)...)
 }
 
 func PrependRequiredThinkingForAssistantText(blocks []format.CoreContentBlock) ([]format.CoreContentBlock, bool) {
@@ -166,7 +173,7 @@ func PrependThinkingBlockForAssistantText(blocks []format.CoreContentBlock, bloc
 	if HasThinkingBlock(blocks) {
 		return blocks, false
 	}
-	return append([]format.CoreContentBlock{normalizeThinkingBlock(block)}, blocks...), true
+	return append([]format.CoreContentBlock{normalizeThinkingBlock(block)}, StripPlaceholderThinkingBlocks(blocks)...), true
 }
 
 func (stream *StreamState) Start(index int, block *format.CoreContentBlock) bool {
@@ -258,15 +265,38 @@ func (state *State) pruneLocked() {
 	}
 }
 
+// HasThinkingBlock reports whether blocks contain a replayable reasoning block.
+// A block with neither thinking text nor a signature is a placeholder written to
+// satisfy the provider's presence check, not real reasoning, so it does not
+// count: otherwise it would mask a cache hit and keep the real thinking from
+// being replayed.
 func HasThinkingBlock(blocks []format.CoreContentBlock) bool {
 	for _, block := range blocks {
-		if block.Type == "reasoning" {
+		if hasThinkingPayload(block) {
 			return true
 		}
 	}
 	return false
 }
 
+// StripPlaceholderThinkingBlocks removes reasoning blocks that carry neither
+// thinking text nor a signature, so a real block can take their place without
+// producing duplicates.
+func StripPlaceholderThinkingBlocks(blocks []format.CoreContentBlock) []format.CoreContentBlock {
+	out := make([]format.CoreContentBlock, 0, len(blocks))
+	for _, block := range blocks {
+		if block.Type == "reasoning" && !hasThinkingPayload(block) {
+			continue
+		}
+		out = append(out, block)
+	}
+	return out
+}
+
+// RequiredThinkingBlock returns the placeholder thinking block used for an
+// assistant turn whose thinking text was never captured. DeepSeek's Anthropic-
+// compatible endpoint accepts it when serialized with both keys, i.e.
+// {"type":"thinking","thinking":"","signature":""}.
 func RequiredThinkingBlock() format.CoreContentBlock {
 	return format.CoreContentBlock{Type: "reasoning", ReasoningText: ""}
 }

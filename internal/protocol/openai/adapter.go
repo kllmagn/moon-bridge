@@ -1525,7 +1525,14 @@ func reasoningBlocksFromSummary(raw json.RawMessage) []format.CoreContentBlock {
 	}
 	blocks := make([]format.CoreContentBlock, 0, len(items))
 	for _, item := range items {
-		if item.Text == "" {
+		// A reasoning item can legitimately carry no summary text while still
+		// holding a replayable signature (the model thought, but the provider
+		// returned no human-readable summary). Dropping it loses the only thing
+		// DeepSeek will accept as proof the thinking chain was passed back, and
+		// the next turn fails with 400 "content[].thinking ... must be passed
+		// back to the API". Keep signature-only items, mirroring
+		// reasoningBlocksFromStreamOutput.
+		if item.Text == "" && item.Signature == "" {
 			continue
 		}
 		blocks = append(blocks, format.CoreContentBlock{

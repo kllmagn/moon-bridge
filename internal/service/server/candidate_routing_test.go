@@ -350,3 +350,171 @@ func TestRememberStreamResponseContentCachesDeepSeekThinkingForLaterReplay(t *te
 		t.Fatalf("prepended stream-response thinking block mismatch, got %+v", head)
 	}
 }
+
+// The placeholder thinking block injected on an earlier turn is not real
+// reasoning. If it counts as satisfying the replay check, a later turn never
+// replays the genuine thinking block the provider asked for, and the request
+// fails with 400 "content[].thinking ... must be passed back to the API".
+// A cache hit must replace the placeholder, not stack behind it.
+func TestPrependCachedThinkingReplacesPlaceholderWithCachedThinking(t *testing.T) {
+	sess := session.New()
+	state := deepseekv4.NewState()
+	state.RememberForToolCalls(
+		[]string{"call-1"},
+		format.CoreContentBlock{
+			Type:               "reasoning",
+			ReasoningText:      "real thinking",
+			ReasoningSignature: "sig-1",
+		},
+	)
+	sess.InitExtensions(map[string]any{"deepseek_v4": state})
+
+	req := &anthropic.MessageRequest{
+		Messages: []anthropic.Message{
+			{
+				Role: "assistant",
+				Content: []anthropic.ContentBlock{
+					// Degenerate placeholder carried in from a previous request.
+					{Type: "thinking"},
+					{Type: "tool_use", ID: "call-1", Name: "exec_command", Input: json.RawMessage(`{}`)},
+				},
+			},
+		},
+	}
+
+	prependCachedThinking(req, sess)
+
+	content := req.Messages[0].Content
+	thinking := 0
+	for _, block := range content {
+		if block.Type != "thinking" {
+			continue
+		}
+		thinking++
+		if block.Thinking != "real thinking" || block.Signature != "sig-1" {
+			t.Fatalf("placeholder not replaced with cached thinking, got %+v", content)
+		}
+	}
+	if thinking != 1 {
+		t.Fatalf("got %d thinking blocks, want exactly 1: %+v", thinking, content)
+	}
+}
+
+// A turn that already carries replayable thinking is left exactly as-is.
+func TestPrependCachedThinkingLeavesReplayableThinkingAlone(t *testing.T) {
+	sess := session.New()
+	state := deepseekv4.NewState()
+	state.RememberForToolCalls([]string{"call-1"}, format.CoreContentBlock{
+		Type:               "reasoning",
+		ReasoningText:      "should not be used",
+		ReasoningSignature: "other-sig",
+	})
+	sess.InitExtensions(map[string]any{"deepseek_v4": state})
+
+	req := &anthropic.MessageRequest{
+		Messages: []anthropic.Message{
+			{
+				Role: "assistant",
+				Content: []anthropic.ContentBlock{
+					{Type: "thinking", Thinking: "original", Signature: "sig-original"},
+					{Type: "tool_use", ID: "call-1", Name: "exec_command", Input: json.RawMessage(`{}`)},
+				},
+			},
+		},
+	}
+
+	prependCachedThinking(req, sess)
+
+	content := req.Messages[0].Content
+	if len(content) != 2 {
+		t.Fatalf("content should be untouched, got %+v", content)
+	}
+	if content[0].Thinking != "original" || content[0].Signature != "sig-original" {
+		t.Fatalf("existing thinking block overwritten: %+v", content[0])
+	}
+}
+
+// A signature-only thinking block counts as replayable and must survive.
+func TestPrependCachedThinkingKeepsSignatureOnlyBlock(t *testing.T) {
+	sess := session.New()
+	sess.InitExtensions(map[string]any{"deepseek_v4": deepseekv4.NewState()})
+
+	req := &anthropic.MessageRequest{
+		Messages: []anthropic.Message{
+			{
+				Role: "assistant",
+				Content: []anthropic.ContentBlock{
+					{Type: "thinking", Signature: "sig-only"},
+					{Type: "tool_use", ID: "call-1", Name: "exec_command", Input: json.RawMessage(`{}`)},
+				},
+			},
+		},
+	}
+
+	prependCachedThinking(req, sess)
+
+	content := req.Messages[0].Content
+	if len(content) != 2 {
+		t.Fatalf("signature-only thinking should satisfy replay, got %+v", content)
+	}
+	if content[0].Type != "thinking" || content[0].Signature != "sig-only" {
+		t.Fatalf("signature-only block damaged: %+v", content[0])
+	}
+}
+
+// Replaying thinking into a request that switched thinking mode off is a
+// protocol mismatch, so an explicit "disabled" turns replay off.
+func TestPrependCachedThinkingSkippedWhenThinkingDisabled(t *testing.T) {
+	sess := session.New()
+	sess.InitExtensions(map[string]any{"deepseek_v4": deepseekv4.NewState()})
+
+	req := &anthropic.MessageRequest{
+		Thinking: &anthropic.ThinkingConfig{Type: "disabled"},
+		Messages: []anthropic.Message{
+			{
+				Role: "assistant",
+				Content: []anthropic.ContentBlock{
+					{Type: "tool_use", ID: "call-1", Name: "exec_command", Input: json.RawMessage(`{}`)},
+				},
+			},
+		},
+	}
+
+	prependCachedThinking(req, sess)
+
+	if len(req.Messages[0].Content) != 1 {
+		t.Fatalf("no thinking block should be injected when thinking is disabled, got %+v", req.Messages[0].Content)
+	}
+}
+
+// End-to-end wire check tying the replay fallback to its serialization: the
+// placeholder block prependCachedThinking injects must reach the provider as
+// {"type":"thinking","thinking":"","signature":""}. If either key is dropped by
+// omitempty, DeepSeek treats the turn as having no thinking and returns 400
+// "The content[].thinking in the thinking mode must be passed back to the API."
+func TestPrependCachedThinkingFallbackSerializesWithBothKeys(t *testing.T) {
+	sess := session.New()
+	sess.InitExtensions(map[string]any{"deepseek_v4": deepseekv4.NewState()})
+
+	req := &anthropic.MessageRequest{
+		Messages: []anthropic.Message{
+			{
+				Role: "assistant",
+				Content: []anthropic.ContentBlock{
+					{Type: "tool_use", ID: "call-1", Name: "exec_command", Input: json.RawMessage(`{}`)},
+				},
+			},
+		},
+	}
+
+	prependCachedThinking(req, sess)
+
+	payload, err := json.Marshal(req.Messages[0].Content)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	const want = `[{"type":"thinking","thinking":"","signature":""},{"type":"tool_use","id":"call-1","name":"exec_command","input":{}}]`
+	if got := string(payload); got != want {
+		t.Fatalf("wire shape mismatch\n got: %s\nwant: %s", got, want)
+	}
+}

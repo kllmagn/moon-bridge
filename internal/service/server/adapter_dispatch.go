@@ -2625,7 +2625,8 @@ func injectAnthropicWebSearch(req *anthropic.MessageRequest) {
 // prependCachedThinking restores thinking blocks before assistant messages
 // for DeepSeek thinking chain replay across conversation turns.
 // It looks up cached thinking blocks from the session state and prepends them
-// before tool_use and text assistant messages in the upstream request.
+// before assistant messages that carry tool_use; text-only turns are accepted by
+// the provider without a thinking block.
 //
 // Important: unlike PrependThinkingBlockForToolUse (which always targets the
 // LAST message), this function targets the SPECIFIC assistant message that
@@ -2644,13 +2645,18 @@ func prependCachedThinking(upstreamReq *anthropic.MessageRequest, sess *session.
 		return
 	}
 
+	// Replaying thinking blocks into a request that switched thinking mode off
+	// is a protocol mismatch of its own, so respect an explicit disable.
+	if !thinkingReplayRequired(upstreamReq) {
+		return
+	}
+
 	// For each assistant message, prepend cached thinking from the previous turn.
 	for i := range upstreamReq.Messages {
 		msg := &upstreamReq.Messages[i]
 		if msg.Role != "assistant" || len(msg.Content) == 0 {
 			continue
 		}
-		// Only tool-call assistant messages require thinking replay fallback.
 		hasToolUse := false
 		for _, block := range msg.Content {
 			if block.Type == "tool_use" {
@@ -2658,11 +2664,9 @@ func prependCachedThinking(upstreamReq *anthropic.MessageRequest, sess *session.
 				break
 			}
 		}
-		if !hasToolUse {
-			continue
-		}
-		// Check if the message already has a thinking block.
-		if hasThinkingBlock(msg.Content) {
+		// A turn that already carries a replayable thinking block is satisfied.
+		// A degenerate placeholder is not — it must fall through to repair below.
+		if hasThinkingPayload(msg.Content) {
 			continue
 		}
 		// Try to prepend cached thinking by tool call ID (for tool_use messages).
@@ -2673,18 +2677,50 @@ func prependCachedThinking(upstreamReq *anthropic.MessageRequest, sess *session.
 			}
 			if cached, ok := state.CachedForToolCall(block.ID); ok {
 				// Prepend thinking block directly to this message, not to the last message.
-				msg.Content = append([]anthropic.ContentBlock{normalizeThinkingBlock(cached)}, msg.Content...)
+				msg.Content = append([]anthropic.ContentBlock{normalizeThinkingBlock(cached)}, stripThinkingBlocks(msg.Content)...)
 				foundCachedThinking = true
 				break
 			}
 		}
-		// Fallback: prepend empty thinking block as response boundary.
-		// Prevents model from continuing previous response text.
-		if !foundCachedThinking && !hasThinkingBlock(msg.Content) {
-			prepended, _ := deepseekv4.PrependRequiredThinkingForAssistantText(anthropicContentSliceToFormat(msg.Content))
-			msg.Content = formatContentSliceToAnthropic(prepended)
+		if foundCachedThinking {
+			continue
 		}
+		// Text-only assistant turns are accepted by the provider without a thinking
+		// block; only turns carrying tool_use trip the replay check.
+		if !hasToolUse {
+			continue
+		}
+		// Fallback: prepend the empty thinking block as a response boundary.
+		// DeepSeek accepts {"thinking":"","signature":""} for a turn whose thinking
+		// text was never captured; ContentBlock.MarshalJSON emits both keys.
+		prepended, _ := deepseekv4.PrependRequiredThinkingForAssistantText(anthropicContentSliceToFormat(msg.Content))
+		msg.Content = formatContentSliceToAnthropic(prepended)
 	}
+}
+
+// thinkingReplayRequired reports whether thinking blocks may be replayed into
+// an upstream Anthropic request. Thinking mode is on by default for DeepSeek, so
+// only an explicit "disabled" turns replay off; sending thinking blocks when the
+// provider ignores them is harmless, sending them against a request that
+// switched thinking mode off is not.
+func thinkingReplayRequired(req *anthropic.MessageRequest) bool {
+	if req == nil {
+		return false
+	}
+	return req.Thinking == nil || req.Thinking.Type != "disabled"
+}
+
+// stripThinkingBlocks removes existing thinking blocks so a repaired block can
+// take their place without producing duplicates.
+func stripThinkingBlocks(blocks []anthropic.ContentBlock) []anthropic.ContentBlock {
+	out := make([]anthropic.ContentBlock, 0, len(blocks))
+	for _, block := range blocks {
+		if block.Type == "thinking" {
+			continue
+		}
+		out = append(out, block)
+	}
+	return out
 }
 
 // normalizeThinkingBlock ensures a thinking block has the correct Type field.
@@ -2696,10 +2732,12 @@ func normalizeThinkingBlock(block format.CoreContentBlock) anthropic.ContentBloc
 	}
 }
 
-// hasThinkingBlock checks if anthropic message content contains a thinking block.
-func hasThinkingBlock(content []anthropic.ContentBlock) bool {
+// hasThinkingPayload checks if anthropic message content contains a thinking
+// block the provider can actually replay — one with thinking text or a
+// signature. Placeholder blocks with neither do not satisfy the replay check.
+func hasThinkingPayload(content []anthropic.ContentBlock) bool {
 	for _, block := range content {
-		if block.Type == "thinking" {
+		if block.HasThinkingPayload() {
 			return true
 		}
 	}

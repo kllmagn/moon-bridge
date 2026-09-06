@@ -438,3 +438,64 @@ func TestFromCoreStream_NoDuplicateDoneForToolUse(t *testing.T) {
 		t.Fatalf("output_item.done (tool) count=%d, want 1", itemDone)
 	}
 }
+
+// A reasoning input item whose summary carries only a signature (no readable
+// text) is still replayable thinking. Dropping it leaves the assistant turn with
+// no thinking block and DeepSeek rejects the next request with 400
+// "content[].thinking ... must be passed back to the API".
+func TestToCoreRequest_KeepsSignatureOnlyReasoningItem(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+
+	req := &openai.ResponsesRequest{
+		Model: "deepseek-v4-pro",
+		Input: json.RawMessage(`[
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"","signature":"sig_abc"}]},
+			{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}
+		]`),
+	}
+
+	result, err := adapter.ToCoreRequest(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Messages) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result.Messages))
+	}
+	blocks := result.Messages[0].Content
+	if len(blocks) != 2 {
+		t.Fatalf("got %d blocks, want reasoning + tool_use: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "reasoning" {
+		t.Fatalf("block[0] type = %q, want reasoning", blocks[0].Type)
+	}
+	if blocks[0].ReasoningSignature != "sig_abc" {
+		t.Errorf("ReasoningSignature = %q, want sig_abc", blocks[0].ReasoningSignature)
+	}
+	if blocks[1].Type != "tool_use" {
+		t.Errorf("block[1] type = %q, want tool_use", blocks[1].Type)
+	}
+}
+
+// A reasoning item with neither text nor signature is empty and stays dropped.
+func TestToCoreRequest_DropsEmptyReasoningItem(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+
+	req := &openai.ResponsesRequest{
+		Model: "deepseek-v4-pro",
+		Input: json.RawMessage(`[
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":""}]},
+			{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}
+		]`),
+	}
+
+	result, err := adapter.ToCoreRequest(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks := result.Messages[0].Content
+	for _, block := range blocks {
+		if block.Type == "reasoning" {
+			t.Fatalf("empty reasoning item should not produce a block: %+v", blocks)
+		}
+	}
+}

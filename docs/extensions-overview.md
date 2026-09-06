@@ -70,6 +70,20 @@ var (
 4. 持续学习（StreamInterceptor）→ 流式场景下同样捕获 thinking 并缓存
 ```
 
+**两个易错点**（对应线上 400 `The content[].thinking in the thinking mode must be passed back to the API.`）：
+
+1. **空 thinking 块必须同时带 `thinking` 与 `signature` 两个字段。** 类型标签上的
+   `omitempty` 会把它们丢掉，API 就把该轮当作没有 thinking。只有
+   `{"type":"thinking","thinking":"","signature":""}` 这一形式会被接受，因此
+   `ContentBlock.MarshalJSON` 对 thinking 块显式输出两个键。
+2. **空 thinking 块是占位符，不算可回放 thinking。** 判断某轮是否已满足回放要求时
+   （`HasThinkingBlock` / `hasThinkingPayload`），必须要求 thinking 文本或 signature
+   至少有一个非空；否则上一轮写入的占位符会屏蔽后续的缓存命中，真正的 thinking
+   永远回放进不了请求。替换占位符时先剥离它，避免出现两个 thinking 块。
+
+只有带 `tool_use` 的 assistant 轮会触发该校验；纯文本轮不带 thinking 也被接受。
+请求显式设置 `thinking.type = "disabled"` 时不做回放。
+
 ### StreamInterceptor
 
 流式场景下拦截 `thinking_delta` / `reasoning_content_delta` 事件，累积完整的 thinking 文本，在流结束时缓存到 session state。

@@ -52,15 +52,27 @@ type ImageSource struct {
 	Data      string `json:"data,omitempty"`
 }
 
+// MarshalJSON serializes a content block.
+//
+// Thinking blocks need special care: the `omitempty` tag on Thinking would drop
+// the field entirely for an empty block, and `omitempty` on Signature would drop
+// an empty signature. DeepSeek's Anthropic-compatible endpoint treats a replayed
+// assistant turn as missing its thinking block unless the block is present with
+// both fields, and answers with HTTP 400 "The content[].thinking in the thinking
+// mode must be passed back to the API."
+//
+// The shape the endpoint accepts for a turn that legitimately had no thinking
+// text is {"type":"thinking","thinking":"","signature":""}, so both keys are
+// emitted explicitly for thinking blocks.
 func (block ContentBlock) MarshalJSON() ([]byte, error) {
-	type contentBlock ContentBlock
-	if block.Type != "thinking" || block.Thinking != "" {
+	if block.Type != "thinking" {
+		type contentBlock ContentBlock
 		return json.Marshal(contentBlock(block))
 	}
 	type thinkingBlock struct {
 		Type         string        `json:"type"`
 		Thinking     string        `json:"thinking"`
-		Signature    string        `json:"signature,omitempty"`
+		Signature    string        `json:"signature"`
 		CacheControl *CacheControl `json:"cache_control,omitempty"`
 	}
 	return json.Marshal(thinkingBlock{
@@ -69,6 +81,14 @@ func (block ContentBlock) MarshalJSON() ([]byte, error) {
 		Signature:    block.Signature,
 		CacheControl: block.CacheControl,
 	})
+}
+
+// HasThinkingPayload reports whether a thinking block carries anything the
+// provider can replay: thinking text and/or a signature. A thinking block with
+// neither is a placeholder, not a replayable reasoning turn, so it must not be
+// counted as satisfying the provider's replay requirement.
+func (block ContentBlock) HasThinkingPayload() bool {
+	return block.Type == "thinking" && (block.Thinking != "" || block.Signature != "")
 }
 
 type Tool struct {
