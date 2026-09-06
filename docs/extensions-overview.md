@@ -72,17 +72,19 @@ var (
 
 **两个易错点**（对应线上 400 `The content[].thinking in the thinking mode must be passed back to the API.`）：
 
-1. **空 thinking 块必须同时带 `thinking` 与 `signature` 两个字段。** 类型标签上的
-   `omitempty` 会把它们丢掉，API 就把该轮当作没有 thinking。只有
-   `{"type":"thinking","thinking":"","signature":""}` 这一形式会被接受，因此
-   `ContentBlock.MarshalJSON` 对 thinking 块显式输出两个键。
-2. **空 thinking 块是占位符，不算可回放 thinking。** 判断某轮是否已满足回放要求时
-   （`HasThinkingBlock` / `hasThinkingPayload`），必须要求 thinking 文本或 signature
-   至少有一个非空；否则上一轮写入的占位符会屏蔽后续的缓存命中，真正的 thinking
-   永远回放进不了请求。替换占位符时先剥离它，避免出现两个 thinking 块。
+1. **thinking-блоки нужно сериализовать без потери полей.** Типовой
+   `omitempty` может убрать пустые `thinking` или `signature`, поэтому
+   `ContentBlock.MarshalJSON` явно сохраняет оба ключа для уже существующего
+   thinking-блока.
+2. **При наличии `tools` проверяются все предыдущие assistant-ходы.** Это
+   относится и к text-only ходам, а не только к сообщениям с `tool_use`.
+   Сначала используется thinking из входного запроса, затем кеш по tool-call ID
+   или тексту assistant-сообщения. Если восстановить исходный payload нельзя,
+   adapter path возвращает локальную ошибку `thinking_replay_unavailable`, а не
+   отправляет искусственный пустой placeholder, который не заменяет reasoning.
 
-只有带 `tool_use` 的 assistant 轮会触发该校验；纯文本轮不带 thinking 也被接受。
-请求显式设置 `thinking.type = "disabled"` 时不做回放。
+   Запрос с явно отключённым thinking (`thinking.type = "disabled"`) не требует
+   replay.
 
 ### StreamInterceptor
 

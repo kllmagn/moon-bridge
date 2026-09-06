@@ -241,8 +241,22 @@ func (s *Server) handleWithAdapters(
 		}
 
 		// Prepend cached reasoning blocks for DeepSeek thinking chain replay.
-		if s.pluginRegistry != nil && sess != nil {
-			prependCachedThinking(upstreamReq, sess)
+		if s.pluginRegistry != nil {
+			if err := prependCachedThinking(upstreamReq, sess); err != nil {
+				log.Error("adapter path: thinking replay unavailable", "error", err)
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: err.Error(),
+						Type:    "invalid_request_error",
+						Code:    "thinking_replay_unavailable",
+					},
+				}
+				record.Error = traceError("thinking_replay", err)
+				record.OpenAIResponse = payload
+				adapterHookErr = "thinking_replay"
+				writeOpenAIError(w, http.StatusBadRequest, payload)
+				return
+			}
 		}
 
 		finalizeAnthropicUpstream := func(_ context.Context, upstream any) (any, error) {
@@ -253,8 +267,10 @@ func (s *Server) handleWithAdapters(
 			if wsMode == "enabled" {
 				injectAnthropicWebSearch(&msgReq)
 			}
-			if s.pluginRegistry != nil && sess != nil {
-				prependCachedThinking(&msgReq, sess)
+			if s.pluginRegistry != nil {
+				if err := prependCachedThinking(&msgReq, sess); err != nil {
+					return nil, err
+				}
 			}
 			return &msgReq, nil
 		}
@@ -262,7 +278,7 @@ func (s *Server) handleWithAdapters(
 		// If streaming, use streaming path.
 		if openAIReq.Stream {
 			adapterCompleted = true
-			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, upstreamReq, preferred, wsMode, wsInjected)
+			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, upstreamReq, preferred, wsMode, wsInjected, sess)
 			record.OpenAIRequest = nil
 			return
 		}
@@ -361,7 +377,7 @@ func (s *Server) handleWithAdapters(
 
 		if openAIReq.Stream {
 			adapterCompleted = true
-			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, chatReq, preferred, wsMode, wsInjected)
+			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, chatReq, preferred, wsMode, wsInjected, sess)
 			record.OpenAIRequest = nil
 			return
 		}
@@ -516,7 +532,7 @@ func (s *Server) handleWithAdapters(
 
 		if openAIReq.Stream {
 			adapterCompleted = true
-			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, googleReq, preferred, wsMode, wsInjected)
+			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, googleReq, preferred, wsMode, wsInjected, sess)
 			record.OpenAIRequest = nil
 			return
 		}
@@ -910,16 +926,13 @@ func (s *Server) handleAdapterStream(
 	candidate provider.ProviderCandidate,
 	wsMode string,
 	wsInjected bool,
+	sess *session.Session,
 ) {
 	log := slog.Default().With("model", openAIReq.Model, "path", "adapter_stream")
 	pm := s.activeProviderManager()
 
 	// Track when the request started for latency measurement.
 	requestStart := time.Now()
-
-	// Get or create session for this request.
-	sess := s.sessionForRequest(r)
-	_ = sess
 
 	// Initialize trace record.
 	bodyBytes, _ := json.Marshal(openAIReq)
@@ -942,8 +955,10 @@ func (s *Server) handleAdapterStream(
 				if wsMode == "enabled" {
 					injectAnthropicWebSearch(&msgReq)
 				}
-				if s.pluginRegistry != nil && sess != nil {
-					prependCachedThinking(&msgReq, sess)
+				if s.pluginRegistry != nil {
+					if err := prependCachedThinking(&msgReq, sess); err != nil {
+						return nil, err
+					}
 				}
 				return &msgReq, nil
 			}
@@ -1024,8 +1039,10 @@ func (s *Server) handleAdapterStream(
 					if wsMode == "enabled" {
 						injectAnthropicWebSearch(&msgReq)
 					}
-					if s.pluginRegistry != nil && sess != nil {
-						prependCachedThinking(&msgReq, sess)
+					if s.pluginRegistry != nil {
+						if err := prependCachedThinking(&msgReq, sess); err != nil {
+							return nil, err
+						}
 					}
 					return &msgReq, nil
 				}
@@ -2622,80 +2639,65 @@ func injectAnthropicWebSearch(req *anthropic.MessageRequest) {
 	})
 }
 
-// prependCachedThinking restores thinking blocks before assistant messages
-// for DeepSeek thinking chain replay across conversation turns.
-// It looks up cached thinking blocks from the session state and prepends them
-// before assistant messages that carry tool_use; text-only turns are accepted by
-// the provider without a thinking block.
+// prependCachedThinking restores thinking blocks before every assistant message
+// in a DeepSeek request that carries tools. DeepSeek requires the thinking
+// payload from all previous assistant turns in that mode, including turns that
+// contain only text.
 //
 // Important: unlike PrependThinkingBlockForToolUse (which always targets the
 // LAST message), this function targets the SPECIFIC assistant message that
 // contains the tool_use, because in follow-up requests the last message
 // is typically a user tool_result.
-func prependCachedThinking(upstreamReq *anthropic.MessageRequest, sess *session.Session) {
-	if upstreamReq == nil || sess == nil || sess.ExtensionData == nil {
-		return
-	}
-	stateRaw, ok := sess.ExtensionData["deepseek_v4"]
-	if !ok {
-		return
-	}
-	state, ok := stateRaw.(*deepseekv4.State)
-	if !ok {
-		return
+func prependCachedThinking(upstreamReq *anthropic.MessageRequest, sess *session.Session) error {
+	if upstreamReq == nil || len(upstreamReq.Tools) == 0 || !thinkingReplayRequired(upstreamReq) {
+		return nil
 	}
 
-	// Replaying thinking blocks into a request that switched thinking mode off
-	// is a protocol mismatch of its own, so respect an explicit disable.
-	if !thinkingReplayRequired(upstreamReq) {
-		return
+	var state *deepseekv4.State
+	if sess != nil && sess.ExtensionData != nil {
+		if stateRaw, ok := sess.ExtensionData["deepseek_v4"]; ok {
+			state, _ = stateRaw.(*deepseekv4.State)
+		}
+	}
+	// The helper is shared by all Anthropic candidates. Only requests with an
+	// active DeepSeek state need this provider-specific replay contract.
+	if state == nil {
+		return nil
 	}
 
-	// For each assistant message, prepend cached thinking from the previous turn.
 	for i := range upstreamReq.Messages {
 		msg := &upstreamReq.Messages[i]
-		if msg.Role != "assistant" || len(msg.Content) == 0 {
+		if msg.Role != "assistant" || len(msg.Content) == 0 || hasThinkingPayload(msg.Content) {
 			continue
 		}
-		hasToolUse := false
-		for _, block := range msg.Content {
-			if block.Type == "tool_use" {
-				hasToolUse = true
-				break
-			}
-		}
-		// A turn that already carries a replayable thinking block is satisfied.
-		// A degenerate placeholder is not — it must fall through to repair below.
-		if hasThinkingPayload(msg.Content) {
-			continue
-		}
-		// Try to prepend cached thinking by tool call ID (for tool_use messages).
-		foundCachedThinking := false
+
+		// Tool-call IDs are the strongest cache key because they identify the
+		// exact assistant turn that produced the tool use.
 		for _, block := range msg.Content {
 			if block.Type != "tool_use" || block.ID == "" {
 				continue
 			}
 			if cached, ok := state.CachedForToolCall(block.ID); ok {
-				// Prepend thinking block directly to this message, not to the last message.
 				msg.Content = append([]anthropic.ContentBlock{normalizeThinkingBlock(cached)}, stripThinkingBlocks(msg.Content)...)
-				foundCachedThinking = true
 				break
 			}
 		}
-		if foundCachedThinking {
+		if hasThinkingPayload(msg.Content) {
 			continue
 		}
-		// Text-only assistant turns are accepted by the provider without a thinking
-		// block; only turns carrying tool_use trip the replay check.
-		if !hasToolUse {
+
+		// Text-only assistant turns use the cache keyed by their visible text.
+		// This path was already implemented in the DeepSeek state but was never
+		// connected to adapter dispatch.
+		cachedBlocks := state.PrependCachedForAssistantText(anthropicContentSliceToFormat(msg.Content))
+		if deepseekv4.HasThinkingBlock(cachedBlocks) {
+			msg.Content = formatContentSliceToAnthropic(cachedBlocks)
 			continue
 		}
-		// Fallback: prepend the empty thinking block as a response boundary.
-		// DeepSeek accepts {"thinking":"","signature":""} for a turn whose thinking
-		// text was never captured; ContentBlock.MarshalJSON emits both keys.
-		prepended, _ := deepseekv4.PrependRequiredThinkingForAssistantText(anthropicContentSliceToFormat(msg.Content))
-		msg.Content = formatContentSliceToAnthropic(prepended)
+
+		return fmt.Errorf("deepseek thinking replay unavailable for assistant message %d", i)
 	}
+	return nil
 }
 
 // thinkingReplayRequired reports whether thinking blocks may be replayed into

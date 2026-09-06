@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	deepseekv4 "moonbridge/internal/extension/deepseek_v4"
@@ -78,7 +79,7 @@ func TestComputeCostWithProviderPricingNilStats(t *testing.T) {
 	}
 }
 
-func TestPrependCachedThinkingSkipsAssistantTextAndFallsBackForToolUse(t *testing.T) {
+func TestPrependCachedThinkingRejectsMissingThinkingWhenToolsPresent(t *testing.T) {
 	sess := session.New()
 	state := deepseekv4.NewState()
 	sess.InitExtensions(map[string]any{
@@ -86,6 +87,7 @@ func TestPrependCachedThinkingSkipsAssistantTextAndFallsBackForToolUse(t *testin
 	})
 
 	req := &anthropic.MessageRequest{
+		Tools: []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
 		Messages: []anthropic.Message{
 			{
 				Role: "assistant",
@@ -102,20 +104,59 @@ func TestPrependCachedThinkingSkipsAssistantTextAndFallsBackForToolUse(t *testin
 		},
 	}
 
+	err := prependCachedThinking(req, sess)
+	if err == nil {
+		t.Fatal("missing thinking should be rejected before the provider call")
+	}
+	if !strings.Contains(err.Error(), "assistant message 0") {
+		t.Fatalf("unexpected replay error: %v", err)
+	}
+}
+
+func TestPrependCachedThinkingRestoresAssistantTextWhenToolsPresent(t *testing.T) {
+	sess := session.New()
+	state := deepseekv4.NewState()
+	state.RememberForAssistantText("plain assistant text", format.CoreContentBlock{
+		Type:               "reasoning",
+		ReasoningText:      "cached text reasoning",
+		ReasoningSignature: "sig-text",
+	})
+	sess.InitExtensions(map[string]any{"deepseek_v4": state})
+
+	req := &anthropic.MessageRequest{
+		Tools: []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
+		Messages: []anthropic.Message{{
+			Role:    "assistant",
+			Content: []anthropic.ContentBlock{{Type: "text", Text: "plain assistant text"}},
+		}},
+	}
+
 	prependCachedThinking(req, sess)
 
-	if len(req.Messages[0].Content) != 1 || req.Messages[0].Content[0].Type != "text" {
-		t.Fatalf("assistant text message should remain unchanged, got %+v", req.Messages[0].Content)
+	content := req.Messages[0].Content
+	if len(content) != 2 {
+		t.Fatalf("assistant text should receive cached thinking, got %+v", content)
+	}
+	if content[0].Type != "thinking" || content[0].Thinking != "cached text reasoning" || content[0].Signature != "sig-text" {
+		t.Fatalf("cached thinking mismatch: %+v", content[0])
+	}
+}
+
+func TestPrependCachedThinkingSkipsReplayWithoutTools(t *testing.T) {
+	sess := session.New()
+	sess.InitExtensions(map[string]any{"deepseek_v4": deepseekv4.NewState()})
+	req := &anthropic.MessageRequest{
+		Messages: []anthropic.Message{{
+			Role:    "assistant",
+			Content: []anthropic.ContentBlock{{Type: "text", Text: "plain assistant text"}},
+		}},
 	}
 
-	if len(req.Messages[1].Content) < 2 {
-		t.Fatalf("tool_use message should receive fallback thinking block, got %+v", req.Messages[1].Content)
+	if err := prependCachedThinking(req, sess); err != nil {
+		t.Fatalf("no-tools request should not require replay: %v", err)
 	}
-	if req.Messages[1].Content[0].Type != "thinking" {
-		t.Fatalf("first block should be thinking fallback, got %+v", req.Messages[1].Content[0])
-	}
-	if req.Messages[1].Content[1].Type != "tool_use" || req.Messages[1].Content[1].ID != "call-miss" {
-		t.Fatalf("tool_use block misplaced after fallback prepend, got %+v", req.Messages[1].Content)
+	if len(req.Messages[0].Content) != 1 || req.Messages[0].Content[0].Type != "text" {
+		t.Fatalf("no-tools request was modified: %+v", req.Messages[0].Content)
 	}
 }
 
@@ -135,6 +176,7 @@ func TestPrependCachedThinkingChecksAllToolUseBlocks(t *testing.T) {
 	})
 
 	req := &anthropic.MessageRequest{
+		Tools: []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
 		Messages: []anthropic.Message{
 			{
 				Role: "assistant",
@@ -194,6 +236,7 @@ func TestRememberAdapterResponseContentCachesDeepSeekThinkingForLaterReplay(t *t
 	rememberAdapterResponseContent(registry, sess, "deepseek-v4-flash", resp)
 
 	req := &anthropic.MessageRequest{
+		Tools: []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
 		Messages: []anthropic.Message{{
 			Role: "assistant",
 			Content: []anthropic.ContentBlock{
@@ -276,6 +319,7 @@ func TestStreamReplayCachesDeepSeekThinkingForLaterReplay(t *testing.T) {
 	registry.OnStreamComplete("deepseek-v4-flash", states, "", sess.ExtensionData)
 
 	req := &anthropic.MessageRequest{
+		Tools: []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
 		Messages: []anthropic.Message{{
 			Role: "assistant",
 			Content: []anthropic.ContentBlock{
@@ -332,6 +376,7 @@ func TestRememberStreamResponseContentCachesDeepSeekThinkingForLaterReplay(t *te
 	}
 
 	req := &anthropic.MessageRequest{
+		Tools: []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
 		Messages: []anthropic.Message{{
 			Role: "assistant",
 			Content: []anthropic.ContentBlock{
@@ -370,6 +415,7 @@ func TestPrependCachedThinkingReplacesPlaceholderWithCachedThinking(t *testing.T
 	sess.InitExtensions(map[string]any{"deepseek_v4": state})
 
 	req := &anthropic.MessageRequest{
+		Tools: []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
 		Messages: []anthropic.Message{
 			{
 				Role: "assistant",
@@ -412,6 +458,7 @@ func TestPrependCachedThinkingLeavesReplayableThinkingAlone(t *testing.T) {
 	sess.InitExtensions(map[string]any{"deepseek_v4": state})
 
 	req := &anthropic.MessageRequest{
+		Tools: []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
 		Messages: []anthropic.Message{
 			{
 				Role: "assistant",
@@ -440,6 +487,7 @@ func TestPrependCachedThinkingKeepsSignatureOnlyBlock(t *testing.T) {
 	sess.InitExtensions(map[string]any{"deepseek_v4": deepseekv4.NewState()})
 
 	req := &anthropic.MessageRequest{
+		Tools: []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
 		Messages: []anthropic.Message{
 			{
 				Role: "assistant",
@@ -470,6 +518,7 @@ func TestPrependCachedThinkingSkippedWhenThinkingDisabled(t *testing.T) {
 
 	req := &anthropic.MessageRequest{
 		Thinking: &anthropic.ThinkingConfig{Type: "disabled"},
+		Tools:    []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
 		Messages: []anthropic.Message{
 			{
 				Role: "assistant",
@@ -487,16 +536,12 @@ func TestPrependCachedThinkingSkippedWhenThinkingDisabled(t *testing.T) {
 	}
 }
 
-// End-to-end wire check tying the replay fallback to its serialization: the
-// placeholder block prependCachedThinking injects must reach the provider as
-// {"type":"thinking","thinking":"","signature":""}. If either key is dropped by
-// omitempty, DeepSeek treats the turn as having no thinking and returns 400
-// "The content[].thinking in the thinking mode must be passed back to the API."
-func TestPrependCachedThinkingFallbackSerializesWithBothKeys(t *testing.T) {
+func TestPrependCachedThinkingDoesNotFabricatePlaceholder(t *testing.T) {
 	sess := session.New()
 	sess.InitExtensions(map[string]any{"deepseek_v4": deepseekv4.NewState()})
 
 	req := &anthropic.MessageRequest{
+		Tools: []anthropic.Tool{{Name: "exec_command", InputSchema: map[string]any{"type": "object"}}},
 		Messages: []anthropic.Message{
 			{
 				Role: "assistant",
@@ -507,14 +552,11 @@ func TestPrependCachedThinkingFallbackSerializesWithBothKeys(t *testing.T) {
 		},
 	}
 
-	prependCachedThinking(req, sess)
-
-	payload, err := json.Marshal(req.Messages[0].Content)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
+	err := prependCachedThinking(req, sess)
+	if err == nil {
+		t.Fatal("missing thinking should be rejected instead of replaced with a placeholder")
 	}
-	const want = `[{"type":"thinking","thinking":"","signature":""},{"type":"tool_use","id":"call-1","name":"exec_command","input":{}}]`
-	if got := string(payload); got != want {
-		t.Fatalf("wire shape mismatch\n got: %s\nwant: %s", got, want)
+	if len(req.Messages[0].Content) != 1 || req.Messages[0].Content[0].Type != "tool_use" {
+		t.Fatalf("request was modified after replay failure: %+v", req.Messages[0].Content)
 	}
 }

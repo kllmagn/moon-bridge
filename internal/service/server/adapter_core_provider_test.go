@@ -235,6 +235,10 @@ func (fakeAnthropicToolUseAdapter) FromCoreRequest(context.Context, *format.Core
 	return &anthropic.MessageRequest{
 		Model:     "deepseek-v4-pro",
 		MaxTokens: 64,
+		Tools: []anthropic.Tool{{
+			Name:        "view_image",
+			InputSchema: map[string]any{"type": "object"},
+		}},
 		Messages: []anthropic.Message{{
 			Role: "assistant",
 			Content: []anthropic.ContentBlock{{
@@ -267,6 +271,12 @@ func TestAdapterCoreProviderPrependsDeepSeekThinkingBeforeAnthropicUpstream(t *t
 	sess := session.NewWithID("codex-session-visual")
 	sess.InitExtensions(map[string]any{
 		"deepseek_v4": deepseekv4.NewState(),
+	})
+	state := sess.ExtensionData["deepseek_v4"].(*deepseekv4.State)
+	state.RememberForToolCalls([]string{"call_view_image"}, format.CoreContentBlock{
+		Type:               "reasoning",
+		ReasoningText:      "cached view-image reasoning",
+		ReasoningSignature: "sig-view-image",
 	})
 	provider := newFinalizingAdapterCoreProvider(fakeAnthropicToolUseAdapter{}, client,
 		func(_ context.Context, upstream any) (any, error) {
