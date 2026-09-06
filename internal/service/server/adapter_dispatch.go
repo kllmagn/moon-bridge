@@ -241,7 +241,7 @@ func (s *Server) handleWithAdapters(
 		}
 
 		// Prepend cached reasoning blocks for DeepSeek thinking chain replay.
-		if s.pluginRegistry != nil {
+		if deepseekReplayEnabled(s.pluginRegistry, openAIReq.Model) {
 			if err := prependCachedThinking(upstreamReq, sess); err != nil {
 				log.Error("adapter path: thinking replay unavailable", "error", err)
 				payload := openai.ErrorResponse{
@@ -267,7 +267,7 @@ func (s *Server) handleWithAdapters(
 			if wsMode == "enabled" {
 				injectAnthropicWebSearch(&msgReq)
 			}
-			if s.pluginRegistry != nil {
+			if deepseekReplayEnabled(s.pluginRegistry, openAIReq.Model) {
 				if err := prependCachedThinking(&msgReq, sess); err != nil {
 					return nil, err
 				}
@@ -955,7 +955,7 @@ func (s *Server) handleAdapterStream(
 				if wsMode == "enabled" {
 					injectAnthropicWebSearch(&msgReq)
 				}
-				if s.pluginRegistry != nil {
+				if deepseekReplayEnabled(s.pluginRegistry, openAIReq.Model) {
 					if err := prependCachedThinking(&msgReq, sess); err != nil {
 						return nil, err
 					}
@@ -1039,7 +1039,7 @@ func (s *Server) handleAdapterStream(
 					if wsMode == "enabled" {
 						injectAnthropicWebSearch(&msgReq)
 					}
-					if s.pluginRegistry != nil {
+					if deepseekReplayEnabled(s.pluginRegistry, openAIReq.Model) {
 						if err := prependCachedThinking(&msgReq, sess); err != nil {
 							return nil, err
 						}
@@ -2637,6 +2637,14 @@ func injectAnthropicWebSearch(req *anthropic.MessageRequest) {
 		Type:    "web_search_20250305",
 		MaxUses: maxUses,
 	})
+}
+
+func deepseekReplayEnabled(registry *plugin.Registry, model string) bool {
+	if registry == nil {
+		return false
+	}
+	deepseek := registry.Plugin(deepseekv4.PluginName)
+	return deepseek != nil && deepseek.EnabledForModel(model)
 }
 
 // prependCachedThinking restores thinking blocks before every assistant message

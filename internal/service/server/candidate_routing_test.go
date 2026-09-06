@@ -160,6 +160,20 @@ func TestPrependCachedThinkingSkipsReplayWithoutTools(t *testing.T) {
 	}
 }
 
+func TestDeepseekReplayEnabledIsModelScoped(t *testing.T) {
+	registry := plugin.NewRegistry(nil)
+	registry.Register(deepseekv4.NewPlugin(func(model string) bool {
+		return model == "deepseek-v4-flash"
+	}))
+
+	if deepseekReplayEnabled(registry, "claude-sonnet") {
+		t.Fatal("DeepSeek replay should be disabled for unrelated models")
+	}
+	if !deepseekReplayEnabled(registry, "deepseek-v4-flash") {
+		t.Fatal("DeepSeek replay should be enabled for the configured model")
+	}
+}
+
 func TestPrependCachedThinkingChecksAllToolUseBlocks(t *testing.T) {
 	sess := session.New()
 	state := deepseekv4.NewState()
