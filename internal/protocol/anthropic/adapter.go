@@ -639,6 +639,7 @@ func (s *streamConverterState) convertEvent(events chan<- format.CoreStreamEvent
 			})
 
 		case "thinking":
+			s.blockSignatures[index] = ev.ContentBlock.Signature
 			s.emit(events, format.CoreStreamEvent{
 				Type:  format.CoreContentBlockStarted,
 				Index: index,
@@ -667,6 +668,11 @@ func (s *streamConverterState) convertEvent(events chan<- format.CoreStreamEvent
 		blockType := s.blockTypes[index]
 
 		switch {
+		case ev.Delta.Type == "signature_delta":
+			if sig := ev.Delta.Signature; sig != "" {
+				s.blockSignatures[index] += sig
+			}
+
 		case ev.Delta.Type == "text_delta" || blockType == "text":
 			// Suppress server-side search status messages (e.g. "Search results for query: ...").
 			// These are infrastructure noise from the Anthropic provider, not model output.
@@ -697,10 +703,6 @@ func (s *streamConverterState) convertEvent(events chan<- format.CoreStreamEvent
 				},
 			})
 
-		case ev.Delta.Type == "signature_delta":
-			if sig := ev.Delta.Signature; sig != "" {
-				s.blockSignatures[index] = sig
-			}
 		}
 
 	case "content_block_stop":
@@ -722,6 +724,7 @@ func (s *streamConverterState) convertEvent(events chan<- format.CoreStreamEvent
 					ReasoningSignature: s.blockSignatures[index],
 				},
 			})
+			delete(s.blockSignatures, index)
 		} else {
 			s.emit(events, format.CoreStreamEvent{
 				Type:  format.CoreContentBlockDone,

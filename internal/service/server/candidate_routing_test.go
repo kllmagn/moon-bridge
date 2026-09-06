@@ -410,6 +410,27 @@ func TestRememberStreamResponseContentCachesDeepSeekThinkingForLaterReplay(t *te
 	}
 }
 
+func TestRememberStreamResponseContentReportsMissingThinking(t *testing.T) {
+	registry := plugin.NewRegistry(nil)
+	registry.Register(deepseekv4.NewPlugin(func(string) bool { return true }))
+	if err := registry.InitAll(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := session.New()
+	sess.InitExtensions(registry.NewSessionData())
+	streamResp := &openai.Response{
+		Output: []openai.OutputItem{
+			{Type: "reasoning", Status: "completed"},
+			{Type: "function_call", CallID: "call-missing", Name: "exec_command", Status: "completed"},
+		},
+	}
+
+	if rememberStreamResponseContent(registry, sess, "deepseek-v4-flash", streamResp) {
+		t.Fatal("empty reasoning must not be reported as replayable")
+	}
+}
+
 // The placeholder thinking block injected on an earlier turn is not real
 // reasoning. If it counts as satisfying the replay check, a later turn never
 // replays the genuine thinking block the provider asked for, and the request

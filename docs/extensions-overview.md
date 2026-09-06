@@ -66,7 +66,7 @@ var (
 3. 回放时（ThinkingPrepender + ReasoningExtractor）→ 在下一轮请求时：
    a. 优先从 reasoning summary 恢复原始 thinking 块（Encode/DecodeThinkingSummary）
    b. 回退到 SessionData 中按 tool_call_id 查找缓存的 thinking
-   c. 最后兜底插入空 thinking 块
+   c. 支持 Responses API 的 `summary_text` 和 `content[].reasoning_text` 两种输入形态
 4. 持续学习（StreamInterceptor）→ 流式场景下同样捕获 thinking 并缓存
 ```
 
@@ -85,6 +85,11 @@ var (
 
    Запрос с явно отключённым thinking (`thinking.type = "disabled"`) не требует
    replay.
+
+3. **流式回放必须保留 signature。** `signature_delta` нельзя превращать в
+   обычный thinking delta и терять; если в итоговом ответе нет replayable
+   thinking/signature, такой ответ нельзя считать успешно сохранённым — нужно
+   продолжить разбор исходных Anthropic stream events для session state.
 
 ### StreamInterceptor
 

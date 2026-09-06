@@ -128,6 +128,102 @@ func TestFromCoreResponse_FunctionCallEmitsNamespace(t *testing.T) {
 	}
 }
 
+func TestFromCoreResponse_UsesCanonicalReasoningSummaryType(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+	coreResp := &format.CoreResponse{
+		Status: "completed",
+		Messages: []format.CoreMessage{{
+			Role: "assistant",
+			Content: []format.CoreContentBlock{{
+				Type:               "reasoning",
+				ReasoningText:      "inspect the request",
+				ReasoningSignature: "sig_1",
+			}},
+		}},
+	}
+
+	raw, err := adapter.FromCoreResponse(context.Background(), coreResp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := raw.(*openai.Response)
+	if len(resp.Output) != 1 || len(resp.Output[0].Summary) != 1 {
+		t.Fatalf("reasoning output = %+v", resp.Output)
+	}
+	if got := resp.Output[0].Summary[0].Type; got != "summary_text" {
+		t.Fatalf("reasoning summary type = %q, want %q", got, "summary_text")
+	}
+}
+
+func TestFromCoreStreamEmitsCanonicalReasoningSummaryEvents(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+	events := make(chan format.CoreStreamEvent, 5)
+	events <- format.CoreStreamEvent{
+		Type:         format.CoreContentBlockStarted,
+		Index:        0,
+		ContentBlock: &format.CoreContentBlock{Type: "reasoning"},
+	}
+	events <- format.CoreStreamEvent{Type: format.CoreTextDelta, Index: 0, Delta: "inspect"}
+	events <- format.CoreStreamEvent{
+		Type:         format.CoreContentBlockDone,
+		Index:        0,
+		ContentBlock: &format.CoreContentBlock{Type: "reasoning", ReasoningSignature: "sig_1"},
+	}
+	events <- format.CoreStreamEvent{Type: format.CoreItemDone, Index: 0}
+	events <- format.CoreStreamEvent{Type: format.CoreEventCompleted, Status: "completed"}
+	close(events)
+
+	resultAny, err := adapter.FromCoreStream(context.Background(), &format.CoreRequest{}, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := resultAny.(*openai.OpenAIStreamResult)
+
+	var sawTextDone, sawPartDone, sawItemDone, sawCompleted bool
+	for event := range result.Chan() {
+		switch event.Event {
+		case "response.reasoning_summary_text.done":
+			sawTextDone = true
+		case "response.reasoning_summary_part.done":
+			sawPartDone = true
+			payload, err := json.Marshal(event.Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(payload), `"part"`) || !strings.Contains(string(payload), `"summary_text"`) {
+				t.Fatalf("reasoning part.done payload = %s", payload)
+			}
+		case "response.output_item.done":
+			item, ok := event.Data.(openai.OutputItemEvent)
+			if !ok || item.Item.Type != "reasoning" || item.Item.Status != "completed" {
+				t.Fatalf("reasoning output_item.done = %+v", event.Data)
+			}
+			sawItemDone = true
+		case "response.completed":
+			lifecycle, ok := event.Data.(openai.ResponseLifecycleEvent)
+			if !ok || len(lifecycle.Response.Output) != 1 || len(lifecycle.Response.Output[0].Summary) != 1 {
+				t.Fatalf("completed response = %+v", event.Data)
+			}
+			if got := lifecycle.Response.Output[0].Summary[0]; got.Type != "summary_text" || got.Signature != "sig_1" || got.Text != "inspect" {
+				t.Fatalf("completed reasoning summary = %+v", got)
+			}
+			sawCompleted = true
+		}
+	}
+	if !sawTextDone {
+		t.Fatal("missing response.reasoning_summary_text.done event")
+	}
+	if !sawPartDone {
+		t.Fatal("missing response.reasoning_summary_part.done event")
+	}
+	if !sawCompleted {
+		t.Fatal("missing response.completed event")
+	}
+	if !sawItemDone {
+		t.Fatal("missing reasoning response.output_item.done event")
+	}
+}
+
 func TestToCoreRequest_AppendsInjectedTools(t *testing.T) {
 	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{
 		InjectTools: func(context.Context) []format.CoreTool {
@@ -473,6 +569,28 @@ func TestToCoreRequest_KeepsSignatureOnlyReasoningItem(t *testing.T) {
 	}
 	if blocks[1].Type != "tool_use" {
 		t.Errorf("block[1] type = %q, want tool_use", blocks[1].Type)
+	}
+}
+
+func TestToCoreRequest_ParsesReasoningContentItems(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+	req := &openai.ResponsesRequest{
+		Model: "deepseek-v4-pro",
+		Input: json.RawMessage(`[
+			{"type":"reasoning","content":[{"type":"reasoning_text","text":"inspect","signature":"sig_1"}]},
+			{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}
+		]`),
+	}
+
+	result, err := adapter.ToCoreRequest(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Messages) != 1 || len(result.Messages[0].Content) != 2 {
+		t.Fatalf("messages = %+v", result.Messages)
+	}
+	if got := result.Messages[0].Content[0]; got.Type != "reasoning" || got.ReasoningText != "inspect" || got.ReasoningSignature != "sig_1" {
+		t.Fatalf("reasoning content = %+v", got)
 	}
 }
 

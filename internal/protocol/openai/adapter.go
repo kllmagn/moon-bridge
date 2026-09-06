@@ -220,7 +220,7 @@ func (a *OpenAIAdapter) FromCoreResponse(ctx context.Context, resp *format.CoreR
 					Type:   "reasoning",
 					Status: "completed",
 					Summary: []ReasoningItemSummary{
-						{Type: "text", Text: block.ReasoningText, Signature: block.ReasoningSignature},
+						{Type: "summary_text", Text: block.ReasoningText, Signature: block.ReasoningSignature},
 					},
 				})
 
@@ -416,6 +416,7 @@ func (a *OpenAIAdapter) streamLoopWithBuf(ctx context.Context, coreReq *format.C
 		Status: "in_progress",
 	}
 	contentText := make(map[int]string)
+	contentSignatures := make(map[int]string)
 	toolCallArgs := make(map[int]string)
 	toolBlockNames := make(map[int]string)
 	outputIndexes := make(map[int]int)
@@ -482,7 +483,8 @@ func (a *OpenAIAdapter) streamLoopWithBuf(ctx context.Context, coreReq *format.C
 			case "reasoning":
 				id := fmt.Sprintf("rs_item_%d", index)
 				itemIDs[index] = id
-				contentText[index] = ""
+				contentText[index] = event.ContentBlock.ReasoningText
+				contentSignatures[index] = event.ContentBlock.ReasoningSignature
 				reasonIndexes[index] = true
 				io := len(response.Output)
 				outputIndexes[index] = io
@@ -509,9 +511,9 @@ func (a *OpenAIAdapter) streamLoopWithBuf(ctx context.Context, coreReq *format.C
 						ItemID:         id,
 						OutputIndex:    io,
 						SummaryIndex:   0,
+						Part:           ReasoningSummaryPart{Type: "summary_text", Text: ""},
 					},
 				})
-				contentText[index] = ""
 			case "tool_use":
 				toolUseID := event.ContentBlock.ToolUseID
 				if toolUseID == "" {
@@ -927,16 +929,29 @@ func (a *OpenAIAdapter) streamLoopWithBuf(ctx context.Context, coreReq *format.C
 			if reasonIndexes[index] {
 				if idx, ok := outputIndexes[index]; ok && idx < len(response.Output) {
 					response.Output[idx].Status = "completed"
-					sig := ""
+					sig := contentSignatures[index]
 					if event.ContentBlock != nil {
-						sig = event.ContentBlock.ReasoningSignature
+						if event.ContentBlock.ReasoningSignature != "" {
+							sig = event.ContentBlock.ReasoningSignature
+						}
 					}
 					response.Output[idx].Summary = []ReasoningItemSummary{{
-						Type:      "text",
+						Type:      "summary_text",
 						Text:      contentText[index],
 						Signature: sig,
 					}}
 				}
+				send(StreamEvent{
+					Event: "response.reasoning_summary_text.done",
+					Data: ReasoningSummaryTextDoneEvent{
+						Type:           "response.reasoning_summary_text.done",
+						SequenceNumber: next(),
+						ItemID:         itemIDs[index],
+						OutputIndex:    outputIndexes[index],
+						SummaryIndex:   0,
+						Text:           contentText[index],
+					},
+				})
 				send(StreamEvent{
 					Event: "response.reasoning_summary_part.done",
 					Data: ReasoningSummaryPartDoneEvent{
@@ -945,11 +960,27 @@ func (a *OpenAIAdapter) streamLoopWithBuf(ctx context.Context, coreReq *format.C
 						ItemID:         itemIDs[index],
 						OutputIndex:    outputIndexes[index],
 						SummaryIndex:   0,
+						Part: ReasoningSummaryPart{
+							Type: "summary_text",
+							Text: contentText[index],
+						},
 					},
 				})
+				if idx, ok := outputIndexes[index]; ok && idx < len(response.Output) {
+					send(StreamEvent{
+						Event: "response.output_item.done",
+						Data: OutputItemEvent{
+							Type:           "response.output_item.done",
+							SequenceNumber: next(),
+							OutputIndex:    idx,
+							Item:           response.Output[idx],
+						},
+					})
+				}
 				delete(contentText, index)
 				delete(itemIDs, index)
 				delete(outputIndexes, index)
+				delete(contentSignatures, index)
 				delete(reasonIndexes, index)
 				break
 			}
@@ -1226,6 +1257,9 @@ func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []fo
 		// Handle reasoning input items — convert to thinking blocks for the next assistant message.
 		if item.Type == "reasoning" {
 			blocks := reasoningBlocksFromSummary(item.Summary)
+			if len(blocks) == 0 {
+				blocks = reasoningBlocksFromContent(item.Content)
+			}
 			if len(pendingFCBlocks) > 0 {
 				pendingFCBlocks = mergeReasoningBeforeToolUse(pendingFCBlocks, blocks)
 				continue
@@ -1538,10 +1572,41 @@ func reasoningBlocksFromSummary(raw json.RawMessage) []format.CoreContentBlock {
 		blocks = append(blocks, format.CoreContentBlock{
 			Type:          "reasoning",
 			ReasoningText: item.Text,
-			// Use Signature from the item if present (adapter-created "text" type).
+			// Use Signature from the item if present (the canonical "summary_text" type).
 			// This preserves the provider-specific thinking signature needed for
 			// continuing reasoning chains across conversation turns.
 			ReasoningSignature: item.Signature,
+		})
+	}
+	return blocks
+}
+
+type reasoningContentPart struct {
+	Type      string `json:"type"`
+	Text      string `json:"text"`
+	Signature string `json:"signature,omitempty"`
+}
+
+func reasoningBlocksFromContent(raw json.RawMessage) []format.CoreContentBlock {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var parts []reasoningContentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil
+	}
+	blocks := make([]format.CoreContentBlock, 0, len(parts))
+	for _, part := range parts {
+		if part.Type != "reasoning_text" && part.Type != "summary_text" && part.Type != "text" {
+			continue
+		}
+		if part.Text == "" && part.Signature == "" {
+			continue
+		}
+		blocks = append(blocks, format.CoreContentBlock{
+			Type:               "reasoning",
+			ReasoningText:      part.Text,
+			ReasoningSignature: part.Signature,
 		})
 	}
 	return blocks

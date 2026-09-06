@@ -3,11 +3,28 @@ package anthropic_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"testing"
 
 	"moonbridge/internal/format"
 	"moonbridge/internal/protocol/anthropic"
 )
+
+type sliceStream struct {
+	events []anthropic.StreamEvent
+	index  int
+}
+
+func (s *sliceStream) Next() (anthropic.StreamEvent, error) {
+	if s.index >= len(s.events) {
+		return anthropic.StreamEvent{}, io.EOF
+	}
+	event := s.events[s.index]
+	s.index++
+	return event, nil
+}
+
+func (s *sliceStream) Close() error { return nil }
 
 // ---------------------------------------------------------------------------
 // noopCacheManager — no-op implementation of anthropic.CacheManager
@@ -63,6 +80,32 @@ func TestFromCoreRequest_BasicTextMessage(t *testing.T) {
 	}
 	if msgReq.Messages[0].Content[0].Text != "hello" {
 		t.Errorf("text = %q", msgReq.Messages[0].Content[0].Text)
+	}
+}
+
+func TestToCoreStreamPreservesThinkingSignatureDelta(t *testing.T) {
+	adapter := newTestAdapter()
+	stream := &sliceStream{events: []anthropic.StreamEvent{
+		{Type: "message_start", Message: &anthropic.MessageResponse{ID: "msg_1", Model: "deepseek-v4-flash"}},
+		{Type: "content_block_start", Index: 0, ContentBlock: &anthropic.ContentBlock{Type: "thinking"}},
+		{Type: "content_block_delta", Index: 0, Delta: anthropic.StreamDelta{Type: "signature_delta", Signature: "sig_1"}},
+		{Type: "content_block_stop", Index: 0},
+		{Type: "message_stop"},
+	}}
+
+	result, err := adapter.ToCoreStream(context.Background(), stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gotSignature string
+	for event := range result.Events {
+		if event.Type == format.CoreContentBlockDone && event.ContentBlock != nil && event.ContentBlock.Type == "reasoning" {
+			gotSignature = event.ContentBlock.ReasoningSignature
+		}
+	}
+	if gotSignature != "sig_1" {
+		t.Fatalf("reasoning signature = %q, want %q", gotSignature, "sig_1")
 	}
 }
 

@@ -819,6 +819,17 @@ func rememberStreamResponseContent(registry *plugin.Registry, sess *session.Sess
 		if len(pending) == 0 {
 			return
 		}
+		hasReplayableThinking := false
+		for _, block := range pending {
+			if block.Type == "reasoning" && (block.ReasoningText != "" || block.ReasoningSignature != "") {
+				hasReplayableThinking = true
+				break
+			}
+		}
+		if !hasReplayableThinking {
+			pending = nil
+			return
+		}
 		registry.RememberContent(reqCtx, pending)
 		pending = nil
 		remembered = true
